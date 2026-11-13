@@ -111,21 +111,30 @@ export default function App() {
     localStorage.setItem('journal_paper_style', style);
   };
 
-  // --- EXPORT & IMPORT BACKUPS ---
+  // --- FIXED JSON EXPORT & IMPORT BACKUPS ---
   const exportJSON = () => {
     saveCurrentPage();
-    const data = {
-      coverImage,
-      paperStyle,
-      pages
-    };
-    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `dairy_backup_${Date.now()}.json`;
-    a.click();
-    URL.revokeObjectURL(url);
+    try {
+      const data = {
+        coverImage,
+        paperStyle,
+        pages
+      };
+      const jsonString = JSON.stringify(data, null, 2);
+      const blob = new Blob([jsonString], { type: 'application/json;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `dairy_backup_${Date.now()}.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (err) {
+      console.error('JSON export error:', err);
+      alert('Failed to generate JSON backup.');
+    }
   };
 
   const importJSON = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -156,11 +165,12 @@ export default function App() {
     reader.readAsText(file);
   };
 
+  // --- FIXED PDF DOCUMENT EXPORT (Direct Print / Download Dialog) ---
   const exportPDF = () => {
     saveCurrentPage();
     const printWindow = window.open('', '_blank');
     if (!printWindow) {
-      alert('Please allow popups to export PDF.');
+      alert('Pop-up blocked! Please allow pop-ups for this app to export PDF.');
       return;
     }
 
@@ -170,22 +180,58 @@ export default function App() {
         <head>
           <title>Dairy Journal Export</title>
           <style>
-            body { font-family: sans-serif; background: #333; margin: 0; padding: 20px; display: flex; flex-direction: column; align-items: center; }
-            .page-container { position: relative; width: 800px; height: 1130px; background: #fbf9f1; margin-bottom: 40px; box-shadow: 0 4px 10px rgba(0,0,0,0.3); ${paperStyle === 'ruled' ? 'background-image: linear-gradient(to bottom, #d1d5db 1px, transparent 1px); background-size: 100% 2.5rem;' : ''} }
-            .page-canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
-            .page-title { position: absolute; bottom: 15px; right: 20px; font-size: 12px; color: #78716c; }
-            @media print { body { background: white; padding: 0; } .page-container { margin: 0; page-break-after: always; box-shadow: none; } }
+            body { 
+              font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; 
+              background: #e5e7eb; 
+              margin: 0; 
+              padding: 20px; 
+              display: flex; 
+              flex-direction: column; 
+              align-items: center; 
+            }
+            .page-container { 
+              position: relative; 
+              width: 800px; 
+              height: 1130px; 
+              background: #fbf9f1; 
+              margin-bottom: 40px; 
+              box-shadow: 0 4px 15px rgba(0,0,0,0.15); 
+              box-sizing: border-box;
+              ${paperStyle === 'ruled' ? 'background-image: linear-gradient(to bottom, #d1d5db 1px, transparent 1px); background-size: 100% 2.5rem;' : ''} 
+            }
+            .page-canvas { 
+              position: absolute; 
+              inset: 0; 
+              width: 100%; 
+              height: 100%; 
+              object-fit: contain; 
+            }
+            .page-footer { 
+              position: absolute; 
+              bottom: 20px; 
+              right: 30px; 
+              font-size: 12px; 
+              color: #78716c; 
+            }
+            @media print { 
+              body { background: white; padding: 0; } 
+              .page-container { margin: 0; box-shadow: none; page-break-after: always; break-after: page; } 
+            }
           </style>
         </head>
         <body>
           ${pages.map((p, idx) => `
             <div class="page-container">
               ${p.dataUrl ? `<img class="page-canvas" src="${p.dataUrl}" />` : ''}
-              <div class="page-title">Page ${idx + 1} ${p.title ? `- ${p.title}` : ''}</div>
+              <div class="page-footer">Page ${idx + 1} ${p.title ? `- ${p.title}` : ''}</div>
             </div>
           `).join('')}
           <script>
-            window.onload = () => { setTimeout(() => { window.print(); }, 500); };
+            window.onload = () => {
+              setTimeout(() => {
+                window.print();
+              }, 400);
+            };
           </script>
         </body>
       </html>
@@ -374,7 +420,7 @@ export default function App() {
           </button>
         </div>
 
-        {/* Paper Canvas Area (Dynamic Ruled vs Unruled background) */}
+        {/* Paper Canvas Area */}
         <div className={`relative flex-1 w-full h-full pt-16 ${paperStyle === 'ruled' ? 'bg-[linear-gradient(to_bottom,#d1d5db_1px,transparent_1px)] bg-[size:100%_2.5rem]' : ''}`}>
           <canvas
             ref={canvasRef}
