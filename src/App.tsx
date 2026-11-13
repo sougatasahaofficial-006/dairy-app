@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Bookmark, BookmarkCheck, List, ArrowLeft, Eraser, PenTool } from 'lucide-react';
+import { Bookmark, BookmarkCheck, List, ArrowLeft, Eraser, PenTool, Settings, Download, Upload, FileText } from 'lucide-react';
 import { ScreenOrientation } from '@capacitor/screen-orientation';
 
 interface PageData {
@@ -31,10 +31,15 @@ export default function App() {
   const [currentPageIndex, setCurrentPageIndex] = useState(0);
   const [toolMode, setToolMode] = useState<'blue' | 'black' | 'eraser'>('blue');
   const [showIndexModal, setShowIndexModal] = useState(false);
+  const [showSettingsModal, setShowSettingsModal] = useState(false);
+  const [paperStyle, setPaperStyle] = useState<'ruled' | 'unruled'>(() => {
+    return (localStorage.getItem('journal_paper_style') as 'ruled' | 'unruled') || 'ruled';
+  });
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [isDrawing, setIsDrawing] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const importFileRef = useRef<HTMLInputElement | null>(null);
 
   // Lock orientation to portrait mode on mount
   useEffect(() => {
@@ -50,15 +55,12 @@ export default function App() {
 
   // Load drawing and setup high-DPI crisp canvas when page changes or book opens
   useEffect(() => {
-    if (isOpen && canvasRef.current && !showIndexModal) {
+    if (isOpen && canvasRef.current && !showIndexModal && !showSettingsModal) {
       const canvas = canvasRef.current;
       const dpr = window.devicePixelRatio || 1;
       
-      // Set high resolution backing store
       canvas.width = window.innerWidth * dpr;
       canvas.height = window.innerHeight * dpr;
-      
-      // Match CSS display size
       canvas.style.width = `${window.innerWidth}px`;
       canvas.style.height = `${window.innerHeight}px`;
 
@@ -79,7 +81,7 @@ export default function App() {
         }
       }
     }
-  }, [isOpen, currentPageIndex, showIndexModal]);
+  }, [isOpen, currentPageIndex, showIndexModal, showSettingsModal]);
 
   const saveCurrentPage = () => {
     const canvas = canvasRef.current;
@@ -104,9 +106,97 @@ export default function App() {
     }
   };
 
+  const handlePaperStyleChange = (style: 'ruled' | 'unruled') => {
+    setPaperStyle(style);
+    localStorage.setItem('journal_paper_style', style);
+  };
+
+  // --- EXPORT & IMPORT BACKUPS ---
+  const exportJSON = () => {
+    saveCurrentPage();
+    const data = {
+      coverImage,
+      paperStyle,
+      pages
+    };
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `dairy_backup_${Date.now()}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const importJSON = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      try {
+        const parsed = JSON.parse(event.target?.result as string);
+        if (parsed.pages) {
+          setPages(parsed.pages);
+          localStorage.setItem('analog_diary_pages', JSON.stringify(parsed.pages));
+        }
+        if (parsed.coverImage) {
+          setCoverImage(parsed.coverImage);
+          localStorage.setItem('journal_cover', parsed.coverImage);
+        }
+        if (parsed.paperStyle) {
+          setPaperStyle(parsed.paperStyle);
+          localStorage.setItem('journal_paper_style', parsed.paperStyle);
+        }
+        alert('Backup successfully imported!');
+        setShowSettingsModal(false);
+      } catch (err) {
+        alert('Invalid JSON backup file.');
+      }
+    };
+    reader.readAsText(file);
+  };
+
+  const exportPDF = () => {
+    saveCurrentPage();
+    const printWindow = window.open('', '_blank');
+    if (!printWindow) {
+      alert('Please allow popups to export PDF.');
+      return;
+    }
+
+    const htmlContent = `
+      <!DOCTYPE html>
+      <html>
+        <head>
+          <title>Dairy Journal Export</title>
+          <style>
+            body { font-family: sans-serif; background: #333; margin: 0; padding: 20px; display: flex; flex-direction: column; align-items: center; }
+            .page-container { position: relative; width: 800px; height: 1130px; background: #fbf9f1; margin-bottom: 40px; box-shadow: 0 4px 10px rgba(0,0,0,0.3); ${paperStyle === 'ruled' ? 'background-image: linear-gradient(to bottom, #d1d5db 1px, transparent 1px); background-size: 100% 2.5rem;' : ''} }
+            .page-canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+            .page-title { position: absolute; bottom: 15px; right: 20px; font-size: 12px; color: #78716c; }
+            @media print { body { background: white; padding: 0; } .page-container { margin: 0; page-break-after: always; box-shadow: none; } }
+          </style>
+        </head>
+        <body>
+          ${pages.map((p, idx) => `
+            <div class="page-container">
+              ${p.dataUrl ? `<img class="page-canvas" src="${p.dataUrl}" />` : ''}
+              <div class="page-title">Page ${idx + 1} ${p.title ? `- ${p.title}` : ''}</div>
+            </div>
+          `).join('')}
+          <script>
+            window.onload = () => { setTimeout(() => { window.print(); }, 500); };
+          </script>
+        </body>
+      </html>
+    `;
+    printWindow.document.write(htmlContent);
+    printWindow.document.close();
+  };
+
   // --- EDGE TAP NAVIGATION (15% margins for turning pages) ---
   const handleEdgeTap = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (showIndexModal) return;
+    if (showIndexModal || showSettingsModal) return;
     if ((e.target as HTMLElement).closest('button')) {
       return;
     }
@@ -183,7 +273,7 @@ export default function App() {
 
     if (toolMode === 'eraser') {
       ctx.globalCompositeOperation = 'destination-out';
-      ctx.lineWidth = 24; // Smooth eraser width
+      ctx.lineWidth = 24;
     } else {
       ctx.globalCompositeOperation = 'source-over';
       ctx.strokeStyle = toolMode === 'blue' ? '#1e3a8a' : '#09090b';
@@ -274,8 +364,18 @@ export default function App() {
           </button>
         </div>
 
-        {/* Ruled Paper Canvas Area */}
-        <div className="relative flex-1 w-full h-full pt-16 bg-[linear-gradient(to_bottom,#d1d5db_1px,transparent_1px)] bg-[size:100%_2.5rem]">
+        {/* Top Right Settings Button */}
+        <div className="absolute top-3 right-3 z-30">
+          <button 
+            onClick={(e) => { e.stopPropagation(); saveCurrentPage(); setShowSettingsModal(true); }}
+            className="flex items-center gap-1 text-xs bg-transparent hover:bg-stone-200/40 text-stone-700 px-2.5 py-1.5 rounded-lg border border-stone-300/40 backdrop-blur transition-all cursor-pointer font-medium"
+          >
+            <Settings size={14} /> Settings
+          </button>
+        </div>
+
+        {/* Paper Canvas Area (Dynamic Ruled vs Unruled background) */}
+        <div className={`relative flex-1 w-full h-full pt-16 ${paperStyle === 'ruled' ? 'bg-[linear-gradient(to_bottom,#d1d5db_1px,transparent_1px)] bg-[size:100%_2.5rem]' : ''}`}>
           <canvas
             ref={canvasRef}
             onPointerDown={startDrawing}
@@ -355,6 +455,84 @@ export default function App() {
                     </div>
                   ))
               )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* --- SETTINGS MODAL --- */}
+      {showSettingsModal && (
+        <div 
+          onClick={(e) => e.stopPropagation()} 
+          className="fixed inset-0 bg-black/60 backdrop-blur-md z-50 flex items-center justify-center p-6"
+        >
+          <div className="bg-stone-900/90 border border-stone-700/60 text-stone-100 max-w-md w-full rounded-2xl shadow-2xl p-6 flex flex-col backdrop-blur-xl">
+            <div className="flex justify-between items-center mb-4 border-b border-stone-800 pb-3">
+              <h2 className="text-lg font-serif text-amber-200">Journal Settings & Backup</h2>
+              <button 
+                onClick={() => setShowSettingsModal(false)}
+                className="text-xs bg-transparent hover:bg-stone-800 px-3 py-1.5 rounded-lg text-stone-300 border border-stone-700/50 cursor-pointer transition-all"
+              >
+                Close
+              </button>
+            </div>
+
+            <div className="space-y-6 py-2">
+              {/* Paper Style Selector */}
+              <div>
+                <label className="text-xs font-medium text-stone-400 uppercase tracking-wider block mb-2">Paper Style</label>
+                <div className="grid grid-cols-2 gap-3">
+                  <button 
+                    onClick={() => handlePaperStyleChange('ruled')}
+                    className={`py-2 px-4 rounded-xl text-xs font-medium border transition-all cursor-pointer ${paperStyle === 'ruled' ? 'bg-amber-600 text-white border-amber-500 shadow' : 'bg-stone-950/60 text-stone-300 border-stone-800 hover:border-stone-700'}`}
+                  >
+                    Ruled Lines
+                  </button>
+                  <button 
+                    onClick={() => handlePaperStyleChange('unruled')}
+                    className={`py-2 px-4 rounded-xl text-xs font-medium border transition-all cursor-pointer ${paperStyle === 'unruled' ? 'bg-amber-600 text-white border-amber-500 shadow' : 'bg-stone-950/60 text-stone-300 border-stone-800 hover:border-stone-700'}`}
+                  >
+                    Unruled (Blank)
+                  </button>
+                </div>
+              </div>
+
+              {/* Data Backup & Restore */}
+              <div>
+                <label className="text-xs font-medium text-stone-400 uppercase tracking-wider block mb-2">Backup & Recovery (JSON)</label>
+                <div className="grid grid-cols-2 gap-3">
+                  <button 
+                    onClick={exportJSON}
+                    className="flex items-center justify-center gap-1.5 py-2.5 px-3 rounded-xl text-xs font-medium bg-stone-950/80 hover:bg-stone-800 text-stone-200 border border-stone-800 transition-all cursor-pointer shadow"
+                  >
+                    <Download size={14} /> Export JSON
+                  </button>
+                  <button 
+                    onClick={() => importFileRef.current?.click()}
+                    className="flex items-center justify-center gap-1.5 py-2.5 px-3 rounded-xl text-xs font-medium bg-stone-950/80 hover:bg-stone-800 text-stone-200 border border-stone-800 transition-all cursor-pointer shadow"
+                  >
+                    <Upload size={14} /> Import JSON
+                  </button>
+                  <input 
+                    type="file" 
+                    ref={importFileRef} 
+                    onChange={importJSON} 
+                    accept=".json" 
+                    className="hidden" 
+                  />
+                </div>
+              </div>
+
+              {/* PDF Export */}
+              <div>
+                <label className="text-xs font-medium text-stone-400 uppercase tracking-wider block mb-2">Document Export</label>
+                <button 
+                  onClick={exportPDF}
+                  className="w-full flex items-center justify-center gap-2 py-2.5 px-4 rounded-xl text-xs font-medium bg-amber-600/90 hover:bg-amber-600 text-white border border-amber-500/60 transition-all cursor-pointer shadow"
+                >
+                  <FileText size={14} /> Export Journal as PDF
+                </button>
+              </div>
             </div>
           </div>
         </div>
