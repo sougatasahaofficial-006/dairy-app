@@ -1,0 +1,49 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Diagnostic output from package manager
+ionide.log
+
+# Dependency directories
+node_modules/
+
+# Production builds
+dist/
+build/
+
+# Native build and cache folders (Optional: you can exclude android build output to keep repo lightweight)
+android/.gradle/
+android/app/build/
+android/build/
+android/capturer/
+.DS_Store
+.vscode/
