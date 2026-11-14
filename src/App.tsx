@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Bookmark, BookmarkCheck, List, ArrowLeft, Eraser, PenTool, Settings, Download, Upload, FileText } from 'lucide-react';
+import { Bookmark, BookmarkCheck, List, ArrowLeft, Eraser, PenTool, Settings, Download, Upload, FileText, ChevronLeft, ChevronRight } from 'lucide-react';
 import { ScreenOrientation } from '@capacitor/screen-orientation';
 import { Filesystem, Directory, Encoding } from '@capacitor/filesystem';
 import { Share } from '@capacitor/share';
@@ -32,6 +32,7 @@ export default function App() {
   });
 
   const [currentPageIndex, setCurrentPageIndex] = useState(0);
+  const [canvasReloadTrigger, setCanvasReloadTrigger] = useState(0);
   const [toolMode, setToolMode] = useState<'blue' | 'black' | 'eraser'>('blue');
   const [showIndexModal, setShowIndexModal] = useState(false);
   const [showSettingsModal, setShowSettingsModal] = useState(false);
@@ -57,9 +58,9 @@ export default function App() {
     lockPortrait();
   }, []);
 
-  // Load drawing and setup high-DPI crisp canvas when page changes or book opens
+  // Load drawing and setup high-DPI crisp canvas ONLY when page changes, book opens, or backup imports (NO BLINK ON STROKE)
   useEffect(() => {
-    if (isOpen && canvasRef.current && !showIndexModal && !showSettingsModal) {
+    if (isOpen && canvasRef.current) {
       const canvas = canvasRef.current;
       const dpr = window.devicePixelRatio || 1;
       
@@ -80,12 +81,15 @@ export default function App() {
           const img = new Image();
           img.src = currentPage.dataUrl;
           img.onload = () => { 
+            ctx.globalCompositeOperation = 'source-over';
             ctx.drawImage(img, 0, 0, window.innerWidth, window.innerHeight); 
           };
         }
       }
     }
-  }, [isOpen, currentPageIndex, showIndexModal, showSettingsModal, pages]);
+    // Intentionally excluding `pages` so finishing a stroke never clears/blinks the active canvas
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOpen, currentPageIndex, canvasReloadTrigger]);
 
   // Returns latest pages array with current canvas saved
   const getLatestPages = (): PageData[] => {
@@ -101,6 +105,34 @@ export default function App() {
 
   const saveCurrentPage = () => {
     getLatestPages();
+  };
+
+  // --- DEDICATED PREVIOUS & NEXT PAGE HANDLERS ---
+  const goToPreviousPage = () => {
+    saveCurrentPage();
+    if (currentPageIndex > 0) {
+      setCurrentPageIndex(currentPageIndex - 1);
+    } else {
+      setIsOpen(false);
+    }
+  };
+
+  const goToNextPage = () => {
+    const latest = getLatestPages();
+    if (currentPageIndex < latest.length - 1) {
+      setCurrentPageIndex(currentPageIndex + 1);
+    } else {
+      const newPage: PageData = {
+        id: Date.now().toString(),
+        dataUrl: '',
+        isBookmarked: false,
+        title: `Page ${latest.length + 1}`
+      };
+      const updated = [...latest, newPage];
+      setPages(updated);
+      localStorage.setItem('analog_diary_pages', JSON.stringify(updated));
+      setCurrentPageIndex(currentPageIndex + 1);
+    }
   };
 
   const handleCoverUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -134,7 +166,6 @@ export default function App() {
     const fileName = `dairy_backup_${Date.now()}.json`;
 
     try {
-      // Write a real .json file to internal Cache (zero permissions required on Android)
       const writtenFile = await Filesystem.writeFile({
         path: fileName,
         data: jsonString,
@@ -142,7 +173,6 @@ export default function App() {
         encoding: Encoding.UTF8,
       });
 
-      // Share the actual .json file attachment (NOT raw text)
       await Share.share({
         title: fileName,
         files: [writtenFile.uri],
@@ -150,7 +180,6 @@ export default function App() {
       });
     } catch (err) {
       console.error('Native JSON file share fallback:', err);
-      // Desktop browser fallback
       const blob = new Blob([jsonString], { type: 'application/json' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -163,7 +192,7 @@ export default function App() {
     }
   };
 
-  // --- ROBUST JSON IMPORT (Handles .json and .txt backups cleanly) ---
+  // --- ROBUST JSON IMPORT ---
   const importJSON = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -171,7 +200,6 @@ export default function App() {
     reader.onload = (event) => {
       try {
         const rawText = (event.target?.result as string) || '';
-        // Strip any accidental prefix/suffix if shared previously as text
         const firstBrace = rawText.indexOf('{');
         const lastBrace = rawText.lastIndexOf('}');
         if (firstBrace === -1 || lastBrace === -1) {
@@ -183,6 +211,7 @@ export default function App() {
         if (Array.isArray(parsed.pages) && parsed.pages.length > 0) {
           setPages(parsed.pages);
           setCurrentPageIndex(0);
+          setCanvasReloadTrigger(prev => prev + 1);
           localStorage.setItem('analog_diary_pages', JSON.stringify(parsed.pages));
         } else {
           throw new Error('Missing pages array');
@@ -228,7 +257,6 @@ export default function App() {
 
     try {
       const latestPages = getLatestPages();
-      // A4 portrait dimensions in points (595.28 x 841.89)
       const pdf = new jsPDF({
         orientation: 'portrait',
         unit: 'pt',
@@ -238,7 +266,6 @@ export default function App() {
       const pageWidth = pdf.internal.pageSize.getWidth();
       const pageHeight = pdf.internal.pageSize.getHeight();
 
-      // Render each page onto an offscreen canvas with cream paper + ruled lines + ink strokes
       for (let i = 0; i < latestPages.length; i++) {
         if (i > 0) {
           pdf.addPage();
@@ -246,7 +273,7 @@ export default function App() {
 
         const p = latestPages[i];
         const offCanvas = document.createElement('canvas');
-        const scale = 2; // High resolution PDF pages
+        const scale = 2;
         offCanvas.width = pageWidth * scale;
         offCanvas.height = pageHeight * scale;
         const ctx = offCanvas.getContext('2d');
@@ -294,19 +321,16 @@ export default function App() {
       }
 
       const fileName = `dairy_journal_${Date.now()}.pdf`;
-      // Extract pure base64 payload from data URI
       const pdfDataUri = pdf.output('datauristring');
       const base64Pdf = pdfDataUri.split(',')[1];
 
       try {
-        // Save real binary .pdf to Android internal Cache
         const writtenPdf = await Filesystem.writeFile({
           path: fileName,
           data: base64Pdf,
           directory: Directory.Cache,
         });
 
-        // Open native Android share/download sheet with the real .pdf file
         await Share.share({
           title: fileName,
           files: [writtenPdf.uri],
@@ -321,48 +345,6 @@ export default function App() {
       alert('Failed to generate PDF: ' + (err instanceof Error ? err.message : String(err)));
     } finally {
       setIsExportingPDF(false);
-    }
-  };
-
-  // --- EDGE TAP NAVIGATION (15% margins for turning pages) ---
-  const handleEdgeTap = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (showIndexModal || showSettingsModal) return;
-    if ((e.target as HTMLElement).closest('button')) {
-      return;
-    }
-
-    const screenWidth = window.innerWidth;
-    const clickX = e.clientX;
-    const margin = screenWidth * 0.15;
-
-    if (!isOpen) {
-      setIsOpen(true);
-      return;
-    }
-
-    if (clickX < margin) {
-      saveCurrentPage();
-      if (currentPageIndex > 0) {
-        setCurrentPageIndex(currentPageIndex - 1);
-      } else {
-        setIsOpen(false);
-      }
-    } else if (clickX > screenWidth - margin) {
-      const latest = getLatestPages();
-      if (currentPageIndex < latest.length - 1) {
-        setCurrentPageIndex(currentPageIndex + 1);
-      } else {
-        const newPage: PageData = {
-          id: Date.now().toString(),
-          dataUrl: '',
-          isBookmarked: false,
-          title: `Page ${latest.length + 1}`
-        };
-        const updated = [...latest, newPage];
-        setPages(updated);
-        localStorage.setItem('analog_diary_pages', JSON.stringify(updated));
-        setCurrentPageIndex(currentPageIndex + 1);
-      }
     }
   };
 
@@ -428,13 +410,13 @@ export default function App() {
   };
 
   return (
-    <div 
-      onClick={handleEdgeTap}
-      className="fixed inset-0 bg-stone-950 overflow-hidden select-none cursor-pointer"
-    >
+    <div className="fixed inset-0 bg-stone-950 overflow-hidden select-none">
       
       {/* --- FULLSCREEN COVER SCREEN --- */}
-      <div className={`absolute inset-0 w-full h-full flex items-center justify-center bg-stone-950 transition-opacity duration-500 ${isOpen ? 'opacity-0 pointer-events-none' : 'opacity-100'}`}>
+      <div 
+        onClick={() => setIsOpen(true)}
+        className={`absolute inset-0 w-full h-full flex items-center justify-center bg-stone-950 cursor-pointer transition-opacity duration-500 ${isOpen ? 'opacity-0 pointer-events-none' : 'opacity-100'}`}
+      >
         <div className="absolute inset-0 w-full h-full bg-zinc-950 flex flex-col justify-center items-center">
           {coverImage ? (
             <img src={coverImage} alt="Cover" className="absolute inset-0 w-full h-full object-cover" />
@@ -496,7 +478,10 @@ export default function App() {
         </div>
 
         {/* Top Right Settings Button */}
-        <div className="absolute top-3 right-3 z-30">
+        <div className="absolute top-3 right-3 z-30 flex items-center gap-2">
+          <span className="text-xs text-stone-400 font-serif mr-1">
+            Page {currentPageIndex + 1} / {pages.length}
+          </span>
           <button 
             onClick={(e) => { e.stopPropagation(); saveCurrentPage(); setShowSettingsModal(true); }}
             className="flex items-center gap-1 text-xs bg-transparent hover:bg-stone-200/40 text-stone-700 px-2.5 py-1.5 rounded-lg border border-stone-300/40 backdrop-blur transition-all cursor-pointer font-medium"
@@ -517,19 +502,28 @@ export default function App() {
           />
         </div>
 
+        {/* Bottom Left Transparent Previous Page Button */}
+        <button
+          onClick={(e) => { e.stopPropagation(); goToPreviousPage(); }}
+          title="Previous Page"
+          className="absolute bottom-6 left-4 z-30 flex items-center justify-center w-10 h-10 rounded-full bg-transparent hover:bg-stone-300/30 active:bg-stone-400/40 text-stone-600 border border-stone-400/40 backdrop-blur-sm transition-all cursor-pointer"
+        >
+          <ChevronLeft size={20} />
+        </button>
+
         {/* Bottom Floating Transparent Toolbar */}
         <div className="absolute bottom-6 left-1/2 -translate-x-1/2 z-30 bg-stone-900/30 hover:bg-stone-900/70 backdrop-blur text-white px-4 py-2 rounded-full shadow-lg flex items-center gap-2 border border-stone-700/30 transition-all">
           <button 
             onClick={(e) => { e.stopPropagation(); setToolMode('blue'); }}
             className={`text-xs px-3 py-1 rounded-full cursor-pointer transition-all flex items-center gap-1 ${toolMode === 'blue' ? 'bg-blue-600/90 text-white shadow' : 'text-stone-300 hover:bg-white/10'}`}
           >
-            <PenTool size={12} /> Blue Ink
+            <PenTool size={12} /> Blue
           </button>
           <button 
             onClick={(e) => { e.stopPropagation(); setToolMode('black'); }}
             className={`text-xs px-3 py-1 rounded-full cursor-pointer transition-all flex items-center gap-1 ${toolMode === 'black' ? 'bg-zinc-800/90 text-white shadow' : 'text-stone-300 hover:bg-white/10'}`}
           >
-            <PenTool size={12} /> Black Ink
+            <PenTool size={12} /> Black
           </button>
           <button 
             onClick={(e) => { e.stopPropagation(); setToolMode('eraser'); }}
@@ -538,6 +532,15 @@ export default function App() {
             <Eraser size={12} /> Eraser
           </button>
         </div>
+
+        {/* Bottom Right Transparent Next Page Button */}
+        <button
+          onClick={(e) => { e.stopPropagation(); goToNextPage(); }}
+          title="Next Page"
+          className="absolute bottom-6 right-4 z-30 flex items-center justify-center w-10 h-10 rounded-full bg-transparent hover:bg-stone-300/30 active:bg-stone-400/40 text-stone-600 border border-stone-400/40 backdrop-blur-sm transition-all cursor-pointer"
+        >
+          <ChevronRight size={20} />
+        </button>
 
       </div>
 
