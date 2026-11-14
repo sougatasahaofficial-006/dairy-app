@@ -1,6 +1,9 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { Bookmark, BookmarkCheck, List, ArrowLeft, Eraser, PenTool, Settings, Download, Upload, FileText } from 'lucide-react';
 import { ScreenOrientation } from '@capacitor/screen-orientation';
+import { Filesystem, Directory, Encoding } from '@capacitor/filesystem';
+import { Share } from '@capacitor/share';
+import { jsPDF } from 'jspdf';
 
 interface PageData {
   id: string;
@@ -32,6 +35,7 @@ export default function App() {
   const [toolMode, setToolMode] = useState<'blue' | 'black' | 'eraser'>('blue');
   const [showIndexModal, setShowIndexModal] = useState(false);
   const [showSettingsModal, setShowSettingsModal] = useState(false);
+  const [isExportingPDF, setIsExportingPDF] = useState(false);
   const [paperStyle, setPaperStyle] = useState<'ruled' | 'unruled'>(() => {
     return (localStorage.getItem('journal_paper_style') as 'ruled' | 'unruled') || 'ruled';
   });
@@ -81,16 +85,22 @@ export default function App() {
         }
       }
     }
-  }, [isOpen, currentPageIndex, showIndexModal, showSettingsModal]);
+  }, [isOpen, currentPageIndex, showIndexModal, showSettingsModal, pages]);
 
-  const saveCurrentPage = () => {
+  // Returns latest pages array with current canvas saved
+  const getLatestPages = (): PageData[] => {
     const canvas = canvasRef.current;
-    if (!canvas) return;
+    if (!canvas || !isOpen) return pages;
     const dataUrl = canvas.toDataURL('image/png');
     const updated = [...pages];
     updated[currentPageIndex] = { ...updated[currentPageIndex], dataUrl };
     setPages(updated);
     localStorage.setItem('analog_diary_pages', JSON.stringify(updated));
+    return updated;
+  };
+
+  const saveCurrentPage = () => {
+    getLatestPages();
   };
 
   const handleCoverUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -111,133 +121,207 @@ export default function App() {
     localStorage.setItem('journal_paper_style', style);
   };
 
-  // --- FIXED JSON EXPORT & IMPORT BACKUPS ---
-  const exportJSON = () => {
-    saveCurrentPage();
+  // --- REAL .JSON FILE EXPORT VIA CACHE + NATIVE SHARE ---
+  const exportJSON = async () => {
+    const latestPages = getLatestPages();
+    const data = {
+      version: 1,
+      coverImage,
+      paperStyle,
+      pages: latestPages
+    };
+    const jsonString = JSON.stringify(data, null, 2);
+    const fileName = `dairy_backup_${Date.now()}.json`;
+
     try {
-      const data = {
-        coverImage,
-        paperStyle,
-        pages
-      };
-      const jsonString = JSON.stringify(data, null, 2);
-      const blob = new Blob([jsonString], { type: 'application/json;charset=utf-8;' });
+      // Write a real .json file to internal Cache (zero permissions required on Android)
+      const writtenFile = await Filesystem.writeFile({
+        path: fileName,
+        data: jsonString,
+        directory: Directory.Cache,
+        encoding: Encoding.UTF8,
+      });
+
+      // Share the actual .json file attachment (NOT raw text)
+      await Share.share({
+        title: fileName,
+        files: [writtenFile.uri],
+        dialogTitle: 'Save or Share JSON Backup',
+      });
+    } catch (err) {
+      console.error('Native JSON file share fallback:', err);
+      // Desktop browser fallback
+      const blob = new Blob([jsonString], { type: 'application/json' });
       const url = URL.createObjectURL(blob);
-      
       const a = document.createElement('a');
       a.href = url;
-      a.download = `dairy_backup_${Date.now()}.json`;
+      a.download = fileName;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
-      setTimeout(() => URL.revokeObjectURL(url), 1000);
-    } catch (err) {
-      console.error('JSON export error:', err);
-      alert('Failed to generate JSON backup.');
+      URL.revokeObjectURL(url);
     }
   };
 
+  // --- ROBUST JSON IMPORT (Handles .json and .txt backups cleanly) ---
   const importJSON = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
     const reader = new FileReader();
     reader.onload = (event) => {
       try {
-        const parsed = JSON.parse(event.target?.result as string);
-        if (parsed.pages) {
-          setPages(parsed.pages);
-          localStorage.setItem('analog_diary_pages', JSON.stringify(parsed.pages));
+        const rawText = (event.target?.result as string) || '';
+        // Strip any accidental prefix/suffix if shared previously as text
+        const firstBrace = rawText.indexOf('{');
+        const lastBrace = rawText.lastIndexOf('}');
+        if (firstBrace === -1 || lastBrace === -1) {
+          throw new Error('No JSON object found in file');
         }
-        if (parsed.coverImage) {
+        const cleanJson = rawText.slice(firstBrace, lastBrace + 1);
+        const parsed = JSON.parse(cleanJson);
+
+        if (Array.isArray(parsed.pages) && parsed.pages.length > 0) {
+          setPages(parsed.pages);
+          setCurrentPageIndex(0);
+          localStorage.setItem('analog_diary_pages', JSON.stringify(parsed.pages));
+        } else {
+          throw new Error('Missing pages array');
+        }
+
+        if (typeof parsed.coverImage === 'string') {
           setCoverImage(parsed.coverImage);
           localStorage.setItem('journal_cover', parsed.coverImage);
         }
-        if (parsed.paperStyle) {
+        if (parsed.paperStyle === 'ruled' || parsed.paperStyle === 'unruled') {
           setPaperStyle(parsed.paperStyle);
           localStorage.setItem('journal_paper_style', parsed.paperStyle);
         }
-        alert('Backup successfully imported!');
+
+        alert('Backup restored successfully!');
         setShowSettingsModal(false);
       } catch (err) {
-        alert('Invalid JSON backup file.');
+        console.error('Import error:', err);
+        alert('Invalid backup file. Please select a valid Dairy .json backup.');
+      } finally {
+        if (importFileRef.current) {
+          importFileRef.current.value = '';
+        }
       }
     };
     reader.readAsText(file);
   };
 
-  // --- FIXED PDF DOCUMENT EXPORT (Direct Print / Download Dialog) ---
-  const exportPDF = () => {
-    saveCurrentPage();
-    const printWindow = window.open('', '_blank');
-    if (!printWindow) {
-      alert('Pop-up blocked! Please allow pop-ups for this app to export PDF.');
-      return;
-    }
+  // Helper to load base64 image onto offscreen canvas
+  const loadImage = (src: string): Promise<HTMLImageElement> => {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = (e) => reject(e);
+      img.src = src;
+    });
+  };
 
-    const htmlContent = `
-      <!DOCTYPE html>
-      <html>
-        <head>
-          <title>Dairy Journal Export</title>
-          <style>
-            body { 
-              font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; 
-              background: #e5e7eb; 
-              margin: 0; 
-              padding: 20px; 
-              display: flex; 
-              flex-direction: column; 
-              align-items: center; 
+  // --- REAL BINARY .PDF GENERATOR & NATIVE ANDROID DOWNLOAD/SHARE ---
+  const exportPDF = async () => {
+    if (isExportingPDF) return;
+    setIsExportingPDF(true);
+
+    try {
+      const latestPages = getLatestPages();
+      // A4 portrait dimensions in points (595.28 x 841.89)
+      const pdf = new jsPDF({
+        orientation: 'portrait',
+        unit: 'pt',
+        format: 'a4'
+      });
+
+      const pageWidth = pdf.internal.pageSize.getWidth();
+      const pageHeight = pdf.internal.pageSize.getHeight();
+
+      // Render each page onto an offscreen canvas with cream paper + ruled lines + ink strokes
+      for (let i = 0; i < latestPages.length; i++) {
+        if (i > 0) {
+          pdf.addPage();
+        }
+
+        const p = latestPages[i];
+        const offCanvas = document.createElement('canvas');
+        const scale = 2; // High resolution PDF pages
+        offCanvas.width = pageWidth * scale;
+        offCanvas.height = pageHeight * scale;
+        const ctx = offCanvas.getContext('2d');
+
+        if (ctx) {
+          ctx.scale(scale, scale);
+
+          // 1. Cream paper background
+          ctx.fillStyle = '#fbf9f1';
+          ctx.fillRect(0, 0, pageWidth, pageHeight);
+
+          // 2. Ruled lines if enabled
+          if (paperStyle === 'ruled') {
+            ctx.strokeStyle = '#d1d5db';
+            ctx.lineWidth = 1;
+            const lineSpacing = 28;
+            for (let y = 56; y < pageHeight - 40; y += lineSpacing) {
+              ctx.beginPath();
+              ctx.moveTo(0, y);
+              ctx.lineTo(pageWidth, y);
+              ctx.stroke();
             }
-            .page-container { 
-              position: relative; 
-              width: 800px; 
-              height: 1130px; 
-              background: #fbf9f1; 
-              margin-bottom: 40px; 
-              box-shadow: 0 4px 15px rgba(0,0,0,0.15); 
-              box-sizing: border-box;
-              ${paperStyle === 'ruled' ? 'background-image: linear-gradient(to bottom, #d1d5db 1px, transparent 1px); background-size: 100% 2.5rem;' : ''} 
+          }
+
+          // 3. Draw handwritten ink strokes
+          if (p.dataUrl) {
+            try {
+              const inkImg = await loadImage(p.dataUrl);
+              ctx.drawImage(inkImg, 0, 0, pageWidth, pageHeight);
+            } catch (imgErr) {
+              console.warn('Could not load page image for PDF:', imgErr);
             }
-            .page-canvas { 
-              position: absolute; 
-              inset: 0; 
-              width: 100%; 
-              height: 100%; 
-              object-fit: contain; 
-            }
-            .page-footer { 
-              position: absolute; 
-              bottom: 20px; 
-              right: 30px; 
-              font-size: 12px; 
-              color: #78716c; 
-            }
-            @media print { 
-              body { background: white; padding: 0; } 
-              .page-container { margin: 0; box-shadow: none; page-break-after: always; break-after: page; } 
-            }
-          </style>
-        </head>
-        <body>
-          ${pages.map((p, idx) => `
-            <div class="page-container">
-              ${p.dataUrl ? `<img class="page-canvas" src="${p.dataUrl}" />` : ''}
-              <div class="page-footer">Page ${idx + 1} ${p.title ? `- ${p.title}` : ''}</div>
-            </div>
-          `).join('')}
-          <script>
-            window.onload = () => {
-              setTimeout(() => {
-                window.print();
-              }, 400);
-            };
-          </script>
-        </body>
-      </html>
-    `;
-    printWindow.document.write(htmlContent);
-    printWindow.document.close();
+          }
+
+          // 4. Subtle footer
+          ctx.fillStyle = '#78716c';
+          ctx.font = '10px sans-serif';
+          ctx.textAlign = 'right';
+          const footerText = `Page ${i + 1}${p.isBookmarked && p.title ? ` — ${p.title}` : ''}`;
+          ctx.fillText(footerText, pageWidth - 24, pageHeight - 18);
+        }
+
+        const pageJpeg = offCanvas.toDataURL('image/jpeg', 0.92);
+        pdf.addImage(pageJpeg, 'JPEG', 0, 0, pageWidth, pageHeight);
+      }
+
+      const fileName = `dairy_journal_${Date.now()}.pdf`;
+      // Extract pure base64 payload from data URI
+      const pdfDataUri = pdf.output('datauristring');
+      const base64Pdf = pdfDataUri.split(',')[1];
+
+      try {
+        // Save real binary .pdf to Android internal Cache
+        const writtenPdf = await Filesystem.writeFile({
+          path: fileName,
+          data: base64Pdf,
+          directory: Directory.Cache,
+        });
+
+        // Open native Android share/download sheet with the real .pdf file
+        await Share.share({
+          title: fileName,
+          files: [writtenPdf.uri],
+          dialogTitle: 'Save or Share Journal PDF',
+        });
+      } catch (nativeErr) {
+        console.log('Falling back to browser PDF download:', nativeErr);
+        pdf.save(fileName);
+      }
+    } catch (err) {
+      console.error('PDF generation failed:', err);
+      alert('Failed to generate PDF: ' + (err instanceof Error ? err.message : String(err)));
+    } finally {
+      setIsExportingPDF(false);
+    }
   };
 
   // --- EDGE TAP NAVIGATION (15% margins for turning pages) ---
@@ -264,17 +348,17 @@ export default function App() {
         setIsOpen(false);
       }
     } else if (clickX > screenWidth - margin) {
-      saveCurrentPage();
-      if (currentPageIndex < pages.length - 1) {
+      const latest = getLatestPages();
+      if (currentPageIndex < latest.length - 1) {
         setCurrentPageIndex(currentPageIndex + 1);
       } else {
         const newPage: PageData = {
           id: Date.now().toString(),
           dataUrl: '',
           isBookmarked: false,
-          title: `Page ${pages.length + 1}`
+          title: `Page ${latest.length + 1}`
         };
-        const updated = [...pages, newPage];
+        const updated = [...latest, newPage];
         setPages(updated);
         localStorage.setItem('analog_diary_pages', JSON.stringify(updated));
         setCurrentPageIndex(currentPageIndex + 1);
@@ -331,6 +415,7 @@ export default function App() {
   };
 
   const stopDrawing = () => {
+    if (!isDrawing) return;
     setIsDrawing(false);
     const canvas = canvasRef.current;
     if (canvas) {
@@ -563,7 +648,7 @@ export default function App() {
                     type="file" 
                     ref={importFileRef} 
                     onChange={importJSON} 
-                    accept=".json" 
+                    accept=".json,.txt,application/json,text/plain" 
                     className="hidden" 
                   />
                 </div>
@@ -574,9 +659,10 @@ export default function App() {
                 <label className="text-xs font-medium text-stone-400 uppercase tracking-wider block mb-2">Document Export</label>
                 <button 
                   onClick={exportPDF}
-                  className="w-full flex items-center justify-center gap-2 py-2.5 px-4 rounded-xl text-xs font-medium bg-amber-600/90 hover:bg-amber-600 text-white border border-amber-500/60 transition-all cursor-pointer shadow"
+                  disabled={isExportingPDF}
+                  className="w-full flex items-center justify-center gap-2 py-2.5 px-4 rounded-xl text-xs font-medium bg-amber-600/90 hover:bg-amber-600 disabled:opacity-50 text-white border border-amber-500/60 transition-all cursor-pointer shadow"
                 >
-                  <FileText size={14} /> Export Journal as PDF
+                  <FileText size={14} /> {isExportingPDF ? 'Generating PDF...' : 'Export Journal as PDF'}
                 </button>
               </div>
             </div>
